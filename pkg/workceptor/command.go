@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,9 +19,24 @@ import (
 	"github.com/google/shlex"
 )
 
+type MockBaseWorkUnitForCommand interface {
+	Init(w *Workceptor, unitID string, workType string, fs FileSystemer, watcher WatcherWrapper)
+	Load() error
+	UpdateBasicStatus(state int, detail string, stdoutSize int64)
+	UpdateFullStatus(statusFunc func(*StatusFileData))
+	MonitorLocalStatus()
+	GetStatus() StatusFileData
+	GetStatusLock() *sync.RWMutex
+	GetBaseStatus() *StatusFileData
+	GetWorkceptor() *Workceptor
+	UnitDir() string
+	CancelCancel()
+	Release(force bool) error
+}
+
 // commandUnit implements the WorkUnit interface for the Receptor command worker plugin.
 type commandUnit struct {
-	BaseWorkUnit
+	bwu                MockBaseWorkUnitForCommand
 	command            string
 	baseParams         string
 	allowRuntimeParams bool
@@ -169,7 +185,7 @@ func (cw *commandUnit) SetFromParams(params map[string]string) error {
 	if cmdParams != "" && !cw.allowRuntimeParams {
 		return fmt.Errorf("extra params provided but not allowed")
 	}
-	cw.status.ExtraData.(*commandExtraData).Params = combineParams(cw.baseParams, cmdParams)
+	cw.bwu.GetStatus().ExtraData.(*commandExtraData).Params = combineParams(cw.baseParams, cmdParams)
 
 	return nil
 }
@@ -181,10 +197,10 @@ func (cw *commandUnit) Status() *StatusFileData {
 
 // UnredactedStatus returns a copy of the status currently loaded in memory, including secrets.
 func (cw *commandUnit) UnredactedStatus() *StatusFileData {
-	cw.statusLock.RLock()
-	defer cw.statusLock.RUnlock()
-	status := cw.getStatus()
-	ed, ok := cw.status.ExtraData.(*commandExtraData)
+	cw.bwu.GetStatusLock().RLock()
+	defer cw.bwu.GetStatusLock().RUnlock()
+	status := cw.bwu.GetBaseStatus()
+	ed, ok := cw.bwu.GetStatus().ExtraData.(*commandExtraData)
 	if ok {
 		edCopy := *ed
 		status.ExtraData = &edCopy
@@ -200,11 +216,11 @@ func (cw *commandUnit) runCommand(cmd *exec.Cmd) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		cw.UpdateBasicStatus(WorkStateFailed, fmt.Sprintf("Failed to start command runner: %s", err), 0)
+		cw.bwu.UpdateBasicStatus(WorkStateFailed, fmt.Sprintf("Failed to start command runner: %s", err), 0)
 
 		return err
 	}
-	cw.UpdateFullStatus(func(status *StatusFileData) {
+	cw.bwu.UpdateFullStatus(func(status *StatusFileData) {
 		if status.ExtraData == nil {
 			status.ExtraData = &commandExtraData{}
 		}
@@ -214,21 +230,21 @@ func (cw *commandUnit) runCommand(cmd *exec.Cmd) error {
 	go func() {
 		<-doneChan
 		cw.done = true
-		cw.UpdateFullStatus(func(status *StatusFileData) {
+		cw.bwu.UpdateFullStatus(func(status *StatusFileData) {
 			status.ExtraData = nil
 		})
 	}()
 	go cmdWaiter(cmd, doneChan)
-	go cw.MonitorLocalStatus()
+	go cw.bwu.MonitorLocalStatus()
 
 	return nil
 }
 
 // Start launches a job with given parameters.
 func (cw *commandUnit) Start() error {
-	level := cw.w.nc.GetLogger().GetLogLevel()
-	levelName, _ := cw.w.nc.GetLogger().LogLevelToName(level)
-	cw.UpdateBasicStatus(WorkStatePending, "Launching command runner", 0)
+	level := cw.bwu.GetWorkceptor().nc.GetLogger().GetLogLevel()
+	levelName, _ := cw.bwu.GetWorkceptor().nc.GetLogger().LogLevelToName(level)
+	cw.bwu.UpdateBasicStatus(WorkStatePending, "Launching command runner", 0)
 
 	// TODO: This is another place where we rely on a pre-built binary for testing.
 	// Consider invoking the commandRunner directly?
@@ -244,14 +260,14 @@ func (cw *commandUnit) Start() error {
 		"--command-runner",
 		fmt.Sprintf("command=%s", cw.command),
 		fmt.Sprintf("params=%s", cw.Status().ExtraData.(*commandExtraData).Params),
-		fmt.Sprintf("unitdir=%s", cw.UnitDir()))
+		fmt.Sprintf("unitdir=%s", cw.bwu.UnitDir()))
 
 	return cw.runCommand(cmd)
 }
 
 // Restart resumes monitoring a job after a Receptor restart.
 func (cw *commandUnit) Restart() error {
-	if err := cw.Load(); err != nil {
+	if err := cw.bwu.Load(); err != nil {
 		return err
 	}
 	state := cw.Status().State
@@ -261,16 +277,16 @@ func (cw *commandUnit) Restart() error {
 	}
 	if state == WorkStatePending {
 		// Job never started - mark it failed
-		cw.UpdateBasicStatus(WorkStateFailed, "Pending at restart", stdoutSize(cw.UnitDir()))
+		cw.bwu.UpdateBasicStatus(WorkStateFailed, "Pending at restart", stdoutSize(cw.bwu.UnitDir()))
 	}
-	go cw.MonitorLocalStatus()
+	go cw.bwu.MonitorLocalStatus()
 
 	return nil
 }
 
 // Cancel stops a running job.
 func (cw *commandUnit) Cancel() error {
-	cw.cancel()
+	cw.bwu.CancelCancel()
 	status := cw.Status()
 	ced, ok := status.ExtraData.(*commandExtraData)
 	if !ok || ced.Pid <= 0 {
@@ -292,7 +308,7 @@ func (cw *commandUnit) Cancel() error {
 
 	proc.Wait()
 
-	cw.UpdateBasicStatus(WorkStateCanceled, "Canceled", -1)
+	cw.bwu.UpdateBasicStatus(WorkStateCanceled, "Canceled", -1)
 
 	return nil
 }
@@ -304,7 +320,7 @@ func (cw *commandUnit) Release(force bool) error {
 		return err
 	}
 
-	return cw.BaseWorkUnit.Release(force)
+	return cw.bwu.Release(force)
 }
 
 // **************************************************************************
@@ -320,13 +336,14 @@ type CommandWorkerCfg struct {
 	VerifySignature    bool   `description:"Verify a signed work submission" default:"false"`
 }
 
-func (cfg CommandWorkerCfg) NewWorker(w *Workceptor, unitID string, workType string) WorkUnit {
+func (cfg CommandWorkerCfg) NewWorker(bwu MockBaseWorkUnitForCommand, w *Workceptor, unitID string, workType string) WorkUnit {
 	cw := &commandUnit{
-		BaseWorkUnit: BaseWorkUnit{
-			status: StatusFileData{
-				ExtraData: &commandExtraData{},
-			},
-		},
+		bwu: bwu,
+		// BaseWorkUnit: BaseWorkUnit{
+		// 	status: StatusFileData{
+		// 		ExtraData: &commandExtraData{},
+		// 	},
+		// },
 		command:            cfg.Command,
 		baseParams:         cfg.Params,
 		allowRuntimeParams: cfg.AllowRuntimeParams,
